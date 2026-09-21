@@ -5,14 +5,15 @@ from datetime import datetime, timezone
 API = "https://api.elections.kalshi.com/trade-api/v2"
 
 st.set_page_config(
-    page_title="Kalshi BTC Monitor",
+    page_title="Kalshi BTC 15M",
     page_icon="₿"
 )
 
 st.title("₿ Kalshi BTC 15M Monitor")
-st.caption("Solo lectura — no coloca órdenes.")
+st.caption("🔴 Solo lectura — no coloca órdenes.")
 
-def buscar_mercados():
+
+def buscar_mercado():
     respuesta = requests.get(
         f"{API}/markets",
         params={
@@ -25,10 +26,23 @@ def buscar_mercados():
 
     respuesta.raise_for_status()
 
-    return respuesta.json().get("markets", [])
+    mercados = respuesta.json().get("markets", [])
+
+    if not mercados:
+        return None
+
+    # El mercado que cierra primero es normalmente
+    # el mercado BTC 15M actualmente activo.
+    mercados.sort(
+        key=lambda m: m.get("close_time", "")
+    )
+
+    return mercados[0]
 
 
-def numero(valor):
+def precio(m, nombre_dolares, nombre_normal):
+    valor = m.get(nombre_dolares, m.get(nombre_normal))
+
     if valor is None:
         return None
 
@@ -38,69 +52,89 @@ def numero(valor):
         return None
 
 
-if st.button("🔍 Buscar mercado BTC 15M", use_container_width=True):
+# Actualización automática cada 10 segundos
+@st.fragment(run_every="10s")
+def monitor():
 
     try:
-        mercados = buscar_mercados()
+        mercado = buscar_mercado()
 
-        if not mercados:
-            st.warning("No hay mercados BTC 15M abiertos en este momento.")
+        if mercado is None:
+            st.warning("⚠️ No hay un mercado BTC 15M abierto.")
+            return
 
-        else:
-            # Ordenar por hora de cierre
-            mercados.sort(
-                key=lambda m: m.get("close_time", "")
-            )
+        ticker = mercado.get("ticker", "N/A")
+        close_time = mercado.get("close_time", "N/A")
 
-            mercado = mercados[0]
+        bid = precio(
+            mercado,
+            "yes_bid_dollars",
+            "yes_bid"
+        )
 
-            ticker = mercado.get("ticker", "Desconocido")
-            close_time = mercado.get("close_time", "")
+        ask = precio(
+            mercado,
+            "yes_ask_dollars",
+            "yes_ask"
+        )
 
-            bid = numero(
-                mercado.get(
-                    "yes_bid_dollars",
-                    mercado.get("yes_bid")
+        st.success("🟢 Mercado BTC 15M encontrado")
+
+        st.subheader("Mercado actual")
+
+        st.code(ticker)
+
+        if close_time != "N/A":
+            try:
+                cierre = datetime.fromisoformat(
+                    close_time.replace("Z", "+00:00")
                 )
-            )
 
-            ask = numero(
-                mercado.get(
-                    "yes_ask_dollars",
-                    mercado.get("yes_ask")
-                )
-            )
+                ahora = datetime.now(timezone.utc)
+                restante = cierre - ahora
 
-            st.success("✅ Mercado encontrado")
+                segundos = int(restante.total_seconds())
 
-            st.subheader("Mercado actual")
+                if segundos > 0:
+                    minutos = segundos // 60
+                    seg = segundos % 60
 
-            st.code(ticker)
-
-            if close_time:
+                    st.info(
+                        f"⏰ Tiempo restante: "
+                        f"{minutos:02d}:{seg:02d}"
+                    )
+                else:
+                    st.warning("⏰ Mercado cerrando...")
+            except:
                 st.write(f"⏰ Cierre: {close_time}")
 
-            col1, col2 = st.columns(2)
+        col1, col2 = st.columns(2)
 
-            with col1:
-                st.metric(
-                    "YES BID",
-                    f"${bid:.4f}" if bid is not None else "N/A"
-                )
+        with col1:
+            st.metric(
+                "YES BID",
+                f"${bid:.4f}" if bid is not None else "N/A"
+            )
 
-            with col2:
-                st.metric(
-                    "YES ASK",
-                    f"${ask:.4f}" if ask is not None else "N/A"
-                )
+        with col2:
+            st.metric(
+                "YES ASK",
+                f"${ask:.4f}" if ask is not None else "N/A"
+            )
 
-            if bid is not None and ask is not None:
-                mid = (bid + ask) / 2
+        if bid is not None and ask is not None:
 
-                st.metric(
-                    "Precio medio",
-                    f"${mid:.4f}"
-                )
+            medio = (bid + ask) / 2
+
+            st.metric(
+                "Precio medio",
+                f"${medio:.4f}"
+            )
+
+        st.caption("🔄 Actualización automática cada 10 segundos")
 
     except Exception as e:
         st.error(f"❌ Error al consultar Kalshi: {e}")
+
+
+monitor()
