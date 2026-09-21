@@ -2,7 +2,7 @@ import os, time
 import requests
 import streamlit as st
 
-API="https://external-api.kalshi.com/trade-api/v2"
+API="https://api-elections.kalshi.com/trade-api/v2"
 
 st.set_page_config(page_title="Kalshi Monitor", page_icon="📊", layout="centered")
 st.title("📊 Kalshi Market Monitor")
