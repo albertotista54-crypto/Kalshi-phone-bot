@@ -1,30 +1,42 @@
 import requests
 import streamlit as st
+import pandas as pd
+import numpy as np
 from datetime import datetime, timezone
 
-# =========================
+# =========================================================
 # CONFIGURACIÓN
-# =========================
+# =========================================================
 
-API = "https://api.elections.kalshi.com/trade-api/v2"
-BTC_API = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
+COINBASE_API = "https://api.exchange.coinbase.com"
 
 st.set_page_config(
-    page_title="Kalshi BTC 15M Monitor",
+    page_title="BTC 15M Smart Monitor",
     page_icon="₿",
     layout="centered"
 )
 
-st.title("₿ Kalshi BTC 15M Monitor")
-st.caption("🔴 Solo lectura — no coloca órdenes.")
+st.title("₿ BTC 15M Smart Monitor")
+st.caption("🔴 Solo lectura — análisis técnico, no coloca órdenes.")
 
-# =========================
+# =========================================================
 # FUNCIONES
-# =========================
+# =========================================================
+
+def numero(valor):
+    if valor is None:
+        return None
+
+    try:
+        return float(valor)
+    except:
+        return None
+
 
 def buscar_mercado():
     respuesta = requests.get(
-        f"{API}/markets",
+        f"{KALSHI_API}/markets",
         params={
             "series_ticker": "KXBTC15M",
             "status": "open",
@@ -40,25 +52,16 @@ def buscar_mercado():
     if not mercados:
         return None
 
-    # Elegimos el mercado que cierre primero
-    mercados.sort(key=lambda m: m.get("close_time", ""))
+    mercados.sort(
+        key=lambda m: m.get("close_time", "")
+    )
 
     return mercados[0]
 
 
-def numero(valor):
-    if valor is None:
-        return None
-
-    try:
-        return float(valor)
-    except:
-        return None
-
-
 def obtener_btc():
     respuesta = requests.get(
-        BTC_API,
+        f"{COINBASE_API}/products/BTC-USD/ticker",
         timeout=10
     )
 
@@ -66,11 +69,62 @@ def obtener_btc():
 
     data = respuesta.json()
 
-    return float(data["data"]["amount"])
+    return float(data["price"])
+
+
+def obtener_velas():
+    respuesta = requests.get(
+        f"{COINBASE_API}/products/BTC-USD/candles",
+        params={
+            "granularity": 900
+        },
+        timeout=10
+    )
+
+    respuesta.raise_for_status()
+
+    datos = respuesta.json()
+
+    if not datos:
+        return None
+
+    df = pd.DataFrame(
+        datos,
+        columns=[
+            "time",
+            "low",
+            "high",
+            "open",
+            "close",
+            "volume"
+        ]
+    )
+
+    df["time"] = pd.to_datetime(
+        df["time"],
+        unit="s",
+        utc=True
+    )
+
+    for columna in [
+        "low",
+        "high",
+        "open",
+        "close",
+        "volume"
+    ]:
+        df[columna] = pd.to_numeric(
+            df[columna],
+            errors="coerce"
+        )
+
+    df = df.sort_values("time")
+
+    return df
 
 
 def obtener_target(mercado):
-    # Campo principal utilizado por los mercados BTC
+
     target = mercado.get("floor_strike")
 
     if target is None:
@@ -82,42 +136,131 @@ def obtener_target(mercado):
     return numero(target)
 
 
-def texto_condicion(mercado):
-    strike_type = mercado.get("strike_type")
+# =========================================================
+# INDICADORES
+# =========================================================
 
-    yes_subtitle = mercado.get("yes_sub_title")
+def calcular_rsi(series, periodo=14):
 
-    if yes_subtitle:
-        return yes_subtitle
+    delta = series.diff()
 
-    condiciones = {
-        "greater": "BTC termina por encima del Target",
-        "greater_or_equal": "BTC termina en o por encima del Target",
-        "less": "BTC termina por debajo del Target",
-        "less_or_equal": "BTC termina en o por debajo del Target",
-        "between": "BTC termina dentro del rango"
-    }
+    ganancias = delta.clip(lower=0)
+    perdidas = -delta.clip(upper=0)
 
-    return condiciones.get(
-        strike_type,
-        "Revisar reglas del mercado"
+    promedio_ganancia = ganancias.rolling(
+        periodo
+    ).mean()
+
+    promedio_perdida = perdidas.rolling(
+        periodo
+    ).mean()
+
+    rs = promedio_ganancia / promedio_perdida
+
+    rsi = 100 - (
+        100 / (1 + rs)
     )
 
-
-# =========================
-# HISTORIAL
-# =========================
-
-if "historial" not in st.session_state:
-    st.session_state.historial = []
-
-if "ticker_anterior" not in st.session_state:
-    st.session_state.ticker_anterior = None
+    return rsi
 
 
-# =========================
+def analizar(df):
+
+    df = df.copy()
+
+    df["EMA9"] = df["close"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    df["EMA21"] = df["close"].ewm(
+        span=21,
+        adjust=False
+    ).mean()
+
+    df["RSI"] = calcular_rsi(
+        df["close"],
+        14
+    )
+
+    df["cambio_3"] = (
+        df["close"]
+        .pct_change(3)
+        * 100
+    )
+
+    df["cambio_1"] = (
+        df["close"]
+        .pct_change(1)
+        * 100
+    )
+
+    return df
+
+
+def calcular_score(df):
+
+    ultimo = df.iloc[-1]
+
+    score = 50
+
+    # EMA
+    if ultimo["EMA9"] > ultimo["EMA21"]:
+        score += 15
+    else:
+        score -= 15
+
+    # Precio vs EMA9
+    if ultimo["close"] > ultimo["EMA9"]:
+        score += 10
+    else:
+        score -= 10
+
+    # Momentum
+    if ultimo["cambio_3"] > 0:
+        score += 10
+    else:
+        score -= 10
+
+    # RSI
+    rsi = ultimo["RSI"]
+
+    if not np.isnan(rsi):
+
+        if 50 <= rsi <= 70:
+            score += 10
+
+        elif 30 <= rsi < 50:
+            score -= 5
+
+        elif rsi > 70:
+            score -= 5
+
+        elif rsi < 30:
+            score += 5
+
+    score = max(
+        0,
+        min(100, score)
+    )
+
+    return score
+
+
+def obtener_tendencia(score):
+
+    if score >= 65:
+        return "🟢 ALCISTA"
+
+    if score <= 35:
+        return "🔴 BAJISTA"
+
+    return "🟡 NEUTRAL"
+
+
+# =========================================================
 # MONITOR
-# =========================
+# =========================================================
 
 @st.fragment(run_every="10s")
 def monitor():
@@ -127,118 +270,93 @@ def monitor():
         mercado = buscar_mercado()
 
         if mercado is None:
-            st.warning("⚠️ No hay un mercado BTC 15M abierto.")
-            return
 
-        ticker = mercado.get("ticker", "N/A")
-
-        # =========================
-        # TARGET
-        # =========================
-
-        target = obtener_target(mercado)
-
-        # =========================
-        # PRECIOS KALSHI
-        # =========================
-
-        yes_bid = numero(
-            mercado.get("yes_bid_dollars")
-        )
-
-        yes_ask = numero(
-            mercado.get("yes_ask_dollars")
-        )
-
-        no_bid = numero(
-            mercado.get("no_bid_dollars")
-        )
-
-        no_ask = numero(
-            mercado.get("no_ask_dollars")
-        )
-
-        last_price = numero(
-            mercado.get("last_price_dollars")
-        )
-
-        # Precio medio YES
-        yes_medio = None
-
-        if yes_bid is not None and yes_ask is not None:
-            yes_medio = (yes_bid + yes_ask) / 2
-
-        # =========================
-        # CAMBIO DE MERCADO
-        # =========================
-
-        if st.session_state.ticker_anterior != ticker:
-
-            st.session_state.historial = []
-            st.session_state.ticker_anterior = ticker
-
-        # =========================
-        # BTC
-        # =========================
-
-        btc = None
-
-        try:
-            btc = obtener_btc()
-        except:
-            pass
-
-        # =========================
-        # HISTORIAL
-        # =========================
-
-        if btc is not None:
-
-            hora = datetime.now(
-                timezone.utc
-            ).strftime("%H:%M:%S")
-
-            st.session_state.historial.append({
-                "hora": hora,
-                "btc": btc
-            })
-
-            st.session_state.historial = (
-                st.session_state.historial[-120:]
+            st.warning(
+                "⚠️ No hay un mercado BTC 15M abierto."
             )
 
-        # =========================
-        # ENCABEZADO
-        # =========================
+            return
 
-        st.success("🟢 Mercado BTC 15M encontrado")
+        ticker = mercado.get(
+            "ticker",
+            "N/A"
+        )
 
-        st.subheader("Mercado actual")
-
-        st.code(ticker)
-
-        # =========================
-        # TIEMPO RESTANTE
-        # =========================
+        target = obtener_target(
+            mercado
+        )
 
         close_time = mercado.get(
             "close_time"
         )
+
+        # -------------------------------------------------
+        # BTC
+        # -------------------------------------------------
+
+        btc = obtener_btc()
+
+        # -------------------------------------------------
+        # VELAS
+        # -------------------------------------------------
+
+        df = obtener_velas()
+
+        if df is None or len(df) < 30:
+
+            st.warning(
+                "Esperando suficientes velas..."
+            )
+
+            return
+
+        df = analizar(df)
+
+        ultimo = df.iloc[-1]
+
+        score = calcular_score(df)
+
+        tendencia = obtener_tendencia(
+            score
+        )
+
+        # -------------------------------------------------
+        # MERCADO
+        # -------------------------------------------------
+
+        st.success(
+            "🟢 Mercado BTC 15M encontrado"
+        )
+
+        st.subheader(
+            "Mercado actual"
+        )
+
+        st.code(ticker)
+
+        # -------------------------------------------------
+        # TIEMPO
+        # -------------------------------------------------
 
         if close_time:
 
             try:
 
                 cierre = datetime.fromisoformat(
-                    close_time.replace("Z", "+00:00")
+                    close_time.replace(
+                        "Z",
+                        "+00:00"
+                    )
                 )
 
-                ahora = datetime.now(timezone.utc)
-
-                restante = cierre - ahora
+                ahora = datetime.now(
+                    timezone.utc
+                )
 
                 segundos = int(
-                    restante.total_seconds()
+                    (
+                        cierre - ahora
+                    ).total_seconds()
                 )
 
                 if segundos > 0:
@@ -259,60 +377,41 @@ def monitor():
 
             except:
 
-                st.write(
-                    f"⏰ Cierre: {close_time}"
-                )
+                pass
 
-        # =========================
-        # BTC Y TARGET
-        # =========================
+        # -------------------------------------------------
+        # BTC VS TARGET
+        # -------------------------------------------------
 
-        st.subheader("₿ BTC vs Target")
+        st.subheader(
+            "₿ BTC vs Target"
+        )
 
         col1, col2 = st.columns(2)
 
         with col1:
 
-            if btc is not None:
-
-                st.metric(
-                    "BTC referencia",
-                    f"${btc:,.2f}"
-                )
-
-            else:
-
-                st.metric(
-                    "BTC referencia",
-                    "N/A"
-                )
+            st.metric(
+                "BTC",
+                f"${btc:,.2f}"
+            )
 
         with col2:
 
-            if target is not None:
+            st.metric(
+                "🎯 Target",
+                f"${target:,.2f}"
+                if target is not None
+                else "N/A"
+            )
 
-                st.metric(
-                    "🎯 Target",
-                    f"${target:,.2f}"
-                )
-
-            else:
-
-                st.metric(
-                    "🎯 Target",
-                    "N/A"
-                )
-
-        # =========================
-        # DISTANCIA
-        # =========================
-
-        if btc is not None and target is not None:
+        if target is not None:
 
             diferencia = btc - target
 
             porcentaje = (
-                diferencia / target
+                diferencia
+                / target
             ) * 100
 
             if diferencia > 0:
@@ -336,211 +435,209 @@ def monitor():
             else:
 
                 st.warning(
-                    "🟡 BTC está exactamente "
-                    "en el Target"
+                    "🟡 BTC está exactamente en el Target"
                 )
 
-        # =========================
-        # CONDICIÓN YES
-        # =========================
+        # -------------------------------------------------
+        # SEÑAL TÉCNICA
+        # -------------------------------------------------
 
-        st.subheader("📌 Condición del mercado")
-
-        st.write(
-            texto_condicion(mercado)
+        st.subheader(
+            "🧠 Análisis técnico"
         )
 
-        # =========================
-        # YES / NO
-        # =========================
-
-        st.subheader("📊 Mercado")
-
         col1, col2 = st.columns(2)
 
         with col1:
 
-            if yes_medio is not None:
-
-                st.metric(
-                    "🟢 YES",
-                    f"${yes_medio:.4f}"
-                )
-
-            else:
-
-                st.metric(
-                    "🟢 YES",
-                    "N/A"
-                )
+            st.metric(
+                "Tendencia",
+                tendencia
+            )
 
         with col2:
 
-            if no_bid is not None and no_ask is not None:
+            st.metric(
+                "Fuerza técnica",
+                f"{score}/100"
+            )
 
-                no_medio = (
-                    no_bid + no_ask
-                ) / 2
+        st.caption(
+            "⚠️ Esta puntuación NO representa "
+            "una probabilidad de ganar. Resume "
+            "varios indicadores técnicos."
+        )
 
-                st.metric(
-                    "🔴 NO",
-                    f"${no_medio:.4f}"
-                )
+        # -------------------------------------------------
+        # INDICADORES
+        # -------------------------------------------------
 
-            elif yes_medio is not None:
-
-                st.metric(
-                    "🔴 NO",
-                    f"${1 - yes_medio:.4f}"
-                )
-
-            else:
-
-                st.metric(
-                    "🔴 NO",
-                    "N/A"
-                )
-
-        # =========================
-        # BID / ASK
-        # =========================
-
-        st.subheader("📖 Precios")
+        st.subheader(
+            "📊 Indicadores"
+        )
 
         col1, col2 = st.columns(2)
 
         with col1:
 
             st.metric(
-                "YES BID",
-                f"${yes_bid:.4f}"
-                if yes_bid is not None
+                "EMA 9",
+                f"${ultimo['EMA9']:,.2f}"
+            )
+
+            st.metric(
+                "RSI",
+                f"{ultimo['RSI']:.1f}"
+                if not np.isnan(ultimo["RSI"])
                 else "N/A"
             )
 
         with col2:
 
             st.metric(
-                "YES ASK",
-                f"${yes_ask:.4f}"
-                if yes_ask is not None
-                else "N/A"
+                "EMA 21",
+                f"${ultimo['EMA21']:,.2f}"
             )
-
-        col1, col2 = st.columns(2)
-
-        with col1:
 
             st.metric(
-                "NO BID",
-                f"${no_bid:.4f}"
-                if no_bid is not None
-                else "N/A"
+                "Momentum 3 velas",
+                f"{ultimo['cambio_3']:+.3f}%"
             )
 
-        with col2:
+        # -------------------------------------------------
+        # INTERPRETACIÓN
+        # -------------------------------------------------
 
-            st.metric(
-                "NO ASK",
-                f"${no_ask:.4f}"
-                if no_ask is not None
-                else "N/A"
+        st.subheader(
+            "🔎 Lectura"
+        )
+
+        if (
+            ultimo["EMA9"]
+            > ultimo["EMA21"]
+            and ultimo["close"]
+            > ultimo["EMA9"]
+        ):
+
+            st.success(
+                "🟢 La estructura actual favorece "
+                "movimiento alcista."
             )
 
-        # =========================
-        # ÚLTIMO PRECIO
-        # =========================
+        elif (
+            ultimo["EMA9"]
+            < ultimo["EMA21"]
+            and ultimo["close"]
+            < ultimo["EMA9"]
+        ):
 
-        if last_price is not None:
-
-            st.metric(
-                "Última operación",
-                f"${last_price:.4f}"
-            )
-
-        # =========================
-        # GRÁFICO BTC
-        # =========================
-
-        st.subheader("📈 Movimiento de BTC")
-
-        if st.session_state.historial:
-
-            datos = st.session_state.historial
-
-            precios = [
-                x["btc"]
-                for x in datos
-            ]
-
-            st.line_chart(
-                precios,
-                height=300
-            )
-
-            st.caption(
-                f"Registros: {len(precios)} "
-                f"• Actualización cada 10 segundos"
+            st.error(
+                "🔴 La estructura actual favorece "
+                "movimiento bajista."
             )
 
         else:
 
-            st.info(
-                "Esperando datos de BTC..."
+            st.warning(
+                "🟡 El mercado está mezclado/neutral. "
+                "No hay una señal técnica limpia."
             )
 
-        # =========================
-        # RESUMEN
-        # =========================
+        # -------------------------------------------------
+        # RSI
+        # -------------------------------------------------
 
-        st.subheader("🔎 Resumen")
+        rsi = ultimo["RSI"]
 
-        if btc is not None and target is not None:
+        if not np.isnan(rsi):
 
-            diferencia = btc - target
+            if rsi >= 70:
 
-            if diferencia > 0:
-
-                st.write(
-                    "🟢 BTC actualmente está "
-                    "**por encima** del Target."
+                st.warning(
+                    f"⚠️ RSI {rsi:.1f}: "
+                    "zona elevada."
                 )
 
-            elif diferencia < 0:
+            elif rsi <= 30:
 
-                st.write(
-                    "🔴 BTC actualmente está "
-                    "**por debajo** del Target."
+                st.warning(
+                    f"⚠️ RSI {rsi:.1f}: "
+                    "zona baja."
                 )
 
             else:
 
                 st.write(
-                    "🟡 BTC está exactamente "
-                    "en el Target."
+                    f"RSI actual: **{rsi:.1f}**"
                 )
 
-        if yes_medio is not None:
+        # -------------------------------------------------
+        # GRÁFICO
+        # -------------------------------------------------
 
-            st.write(
-                f"Precio medio de YES: "
-                f"**${yes_medio:.4f}**"
-            )
+        st.subheader(
+            "📈 BTC — velas de 15 minutos"
+        )
 
-            st.caption(
-                "El precio de YES refleja la valoración "
-                "actual del mercado; no es una garantía "
-                "del resultado."
-            )
+        grafico = df[
+            [
+                "close",
+                "EMA9",
+                "EMA21"
+            ]
+        ].tail(50)
+
+        grafico = grafico.rename(
+            columns={
+                "close": "BTC",
+                "EMA9": "EMA 9",
+                "EMA21": "EMA 21"
+            }
+        )
+
+        st.line_chart(
+            grafico,
+            height=350
+        )
+
+        # -------------------------------------------------
+        # ÚLTIMAS VELAS
+        # -------------------------------------------------
+
+        st.subheader(
+            "🕯️ Últimas velas"
+        )
+
+        ultimas = df.tail(5)[
+            [
+                "time",
+                "open",
+                "high",
+                "low",
+                "close"
+            ]
+        ].copy()
+
+        ultimas["time"] = ultimas[
+            "time"
+        ].dt.strftime(
+            "%H:%M"
+        )
+
+        st.dataframe(
+            ultimas,
+            hide_index=True,
+            use_container_width=True
+        )
 
         st.caption(
             "🔄 Actualización automática cada 10 segundos"
         )
 
         st.caption(
-            "⚠️ El precio BTC mostrado es una referencia "
-            "spot y puede diferir del índice utilizado "
-            "para la liquidación de Kalshi."
+            "⚠️ BTC mostrado es precio spot de Coinbase. "
+            "Puede diferir del índice utilizado por Kalshi "
+            "para la liquidación."
         )
 
     except Exception as e:
